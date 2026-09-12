@@ -47,6 +47,48 @@ const ROLE_IDS_BY_FACTION = {
   EB: EB_ROLE_IDS_BY_RANK,
 };
 
+const EB_NICK_PREFIX_BY_RANK = {
+  1: "Rec",
+  2: "Sd",
+  3: "Cb",
+  4: "3-Sgt",
+  5: "2-Sgt",
+  6: "1-Sgt",
+  7: "S-Ten",
+  8: "Asp",
+  9: "2-Ten",
+  10: "1-Ten",
+  11: "Cap",
+  12: "Maj",
+  13: "Ten-Cel",
+  14: "Cel",
+  15: "Gen-Bda",
+  16: "Gen-Div",
+  17: "Gen-Ex",
+  18: "Sub-Com",
+  19: "Com",
+  22: "Mch",
+};
+
+const EB_MILITARY_ROLE_ID = "1255140075281449074";
+
+const EB_TIER_ROLES = [
+  { min: 1, max: 2, roleId: "1255144360631337000" },
+  { min: 3, max: 7, roleId: "1255144335377301625" },
+  { min: 8, max: 10, roleId: "1255144296286523403" },
+  { min: 11, max: 11, roleId: "1255140068448931860" },
+  { min: 12, max: 14, roleId: "1255140066427273338" },
+  { min: 15, max: 17, roleId: "1255144226304430161" },
+  { min: 18, max: 22, roleId: "1255144259401552044" },
+];
+
+const EB_DIVISION_ROLE_IDS = {
+  BPE: "1399586149596528851",
+  BFE: "1399586139299643612",
+  BAC: "1399586149881614366",
+  CIE: "1399586154575298641",
+};
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
@@ -112,6 +154,67 @@ function getRankRoleId(payload) {
   return roleIds[Number(payload.rank)] || null;
 }
 
+function getTierRoleId(faction, rank) {
+  if (faction !== "EB") {
+    return null;
+  }
+
+  const tier = EB_TIER_ROLES.find((item) => rank >= item.min && rank <= item.max);
+  return tier ? tier.roleId : null;
+}
+
+function getDivisionKey(division) {
+  const value = String(division || "").toUpperCase();
+  if (value.includes("BPE") || value.includes("POLIC")) return "BPE";
+  if (value.includes("BFE") || value.includes("FOR")) return "BFE";
+  if (value.includes("BAC") || value.includes("COMAND")) return "BAC";
+  if (value.includes("CIE") || value.includes("INTELIG")) return "CIE";
+  return null;
+}
+
+function uniqueRoleIds(roleIds) {
+  return [...new Set(roleIds.filter(Boolean).map(String))];
+}
+
+function getManagedRoleIds(faction) {
+  if (faction !== "EB") {
+    return uniqueRoleIds(Object.values(getFactionRoleIds(faction)));
+  }
+
+  return uniqueRoleIds([
+    ...Object.values(EB_ROLE_IDS_BY_RANK),
+    EB_MILITARY_ROLE_ID,
+    ...EB_TIER_ROLES.map((item) => item.roleId),
+    ...Object.values(EB_DIVISION_ROLE_IDS),
+  ]);
+}
+
+function getNicknameBase(member, robloxUsername) {
+  const currentName = member.nickname || member.user.globalName || member.user.username || robloxUsername;
+  return String(currentName || robloxUsername || member.user.username).replace(/^\[[^\]]+\]\s*/, "").trim();
+}
+
+async function applyNickname(member, rank, robloxUsername) {
+  const prefix = EB_NICK_PREFIX_BY_RANK[rank];
+  if (!prefix) {
+    return { ok: true, skipped: true };
+  }
+
+  const baseName = getNicknameBase(member, robloxUsername);
+  const nextNickname = `[${prefix}] ${baseName}`.slice(0, 32);
+  if (member.nickname === nextNickname) {
+    return { ok: true, unchanged: true };
+  }
+
+  try {
+    await member.setNickname(nextNickname, "Roblox rank sync");
+    return { ok: true, nickname: nextNickname };
+  } catch (error) {
+    console.warn(`[sync-rank] nao consegui alterar apelido de ${member.user.tag}: ${error.message}`);
+    return { ok: false, error: error.message };
+  }
+}
+
 async function syncRank(payload) {
   if (!client.isReady()) {
     return { ok: false, status: 503, error: "bot_not_ready" };
@@ -123,6 +226,15 @@ async function syncRank(payload) {
   const faction = String(payload.faction || "").toUpperCase();
   const rank = Number(payload.rank);
   const roleId = getRankRoleId(payload);
+  const tierRoleId = getTierRoleId(faction, rank);
+  const divisionKey = getDivisionKey(payload.division);
+  const divisionRoleId = faction === "EB" && divisionKey ? EB_DIVISION_ROLE_IDS[divisionKey] : null;
+  const rolesToKeep = uniqueRoleIds([
+    roleId,
+    faction === "EB" ? EB_MILITARY_ROLE_ID : null,
+    tierRoleId,
+    divisionRoleId,
+  ]);
 
   if (!guildId || !discordUserId || !faction || !rank || !roleId) {
     return {
@@ -135,16 +247,19 @@ async function syncRank(payload) {
 
   const guild = await client.guilds.fetch(guildId);
   const member = await guild.members.fetch(discordUserId);
-  const factionRoleIds = Object.values(getFactionRoleIds(faction)).filter(Boolean);
-  const rolesToRemove = factionRoleIds.filter((id) => id !== roleId && member.roles.cache.has(id));
+  const managedRoleIds = getManagedRoleIds(faction);
+  const rolesToRemove = managedRoleIds.filter((id) => !rolesToKeep.includes(id) && member.roles.cache.has(id));
+  const rolesToAdd = rolesToKeep.filter((id) => !member.roles.cache.has(id));
 
   if (rolesToRemove.length > 0) {
     await member.roles.remove(rolesToRemove, "Roblox rank sync");
   }
 
-  if (!member.roles.cache.has(roleId)) {
-    await member.roles.add(roleId, "Roblox rank sync");
+  if (rolesToAdd.length > 0) {
+    await member.roles.add(rolesToAdd, "Roblox rank sync");
   }
+
+  const nickname = faction === "EB" ? await applyNickname(member, rank, payload.robloxUsername) : { skipped: true };
 
   console.log(
     `[sync-rank] ${payload.robloxUsername || payload.robloxUserId || discordUserId} -> ${faction} rank ${rank} (${roleId})`
@@ -156,7 +271,11 @@ async function syncRank(payload) {
     faction,
     rank,
     roleId,
+    added: rolesToAdd,
     removed: rolesToRemove,
+    tierRoleId,
+    divisionRoleId,
+    nickname,
   };
 }
 
